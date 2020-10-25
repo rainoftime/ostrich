@@ -22,6 +22,9 @@ import ap.basetypes.IdealInt
 import ap.parser._
 import ap.theories.strings.StringTheory
 
+/**
+ * Pre-processor for reducing some operators to more basic ones.
+ */
 class OstrichPreprocessor(theory : OstrichStringTheory)
       extends ContextAwareVisitor[Unit, IExpression] {
 
@@ -42,12 +45,6 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
   private def strCat(ts : ITerm*) : ITerm = ts match {
     case Seq() => str_empty()
     case ts    => ts reduceLeft (str_++(_, _))
-  }
-
-  // TODO: move this to Princess
-  private def str2term(str : String) : ITerm = str match {
-    case ""  => str_empty()
-    case str => str_cons(str.head, str2term(str.substring(1)))
   }
 
   def apply(f : IFormula) : IFormula =
@@ -79,7 +76,19 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
           Seq(subStr : ITerm, bigStr : ITerm)) if ctxt.polarity < 0 => {
       val s = VariableShiftVisitor(subStr, 0, 1)
       val t = VariableShiftVisitor(bigStr, 0, 1)
-      StringSort.ex(str_++(s, v(0)) === t)
+      StringSort.ex(str_++(s, v(0, StringSort)) === t)
+    }
+
+    case (IAtom(`str_suffixof`, _),
+          Seq(subStr@ConcreteString(_), bigStr : ITerm)) => {
+      val asRE = re_++(re_all(), str_to_re(subStr))
+      str_in_re(bigStr, asRE)
+    }
+    case (IAtom(`str_suffixof`, _),
+          Seq(subStr : ITerm, bigStr : ITerm)) if ctxt.polarity < 0 => {
+      val s = VariableShiftVisitor(subStr, 0, 1)
+      val t = VariableShiftVisitor(bigStr, 0, 1)
+      StringSort.ex(str_++(v(0, StringSort), s) === t)
     }
 
     case (IFunApp(`str_indexof`, _),
@@ -104,9 +113,9 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
 
       eps(StringSort.ex(StringSort.ex(
         (ind === -1 & !str_in_re(shBigStr3, containingStr)) |
-        (ind === str_len(v(0)) &
-           strCat(v(0), subStr, v(1)) === shBigStr3 &
-           !str_in_re(v(0), containingOrSuffix))
+        (ind === str_len(v(0, StringSort)) &
+           strCat(v(0, StringSort), subStr, v(1, StringSort)) === shBigStr3 &
+           !str_in_re(v(0, StringSort), containingOrSuffix))
       )))
     }
 
@@ -116,12 +125,12 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
       val shBegin3  = VariableShiftVisitor(begin, 0, 3)
       val shLen3    = VariableShiftVisitor(len, 0, 3)
 
-      eps(StringSort.ex(StringSort.ex(
-        strCat(v(1), v(2), v(0)) === shBigStr3 &
-        str_len(v(1)) === shBegin3 &
-        str_len(v(2)) === shLen3     // TODO: what should happen when
-                                     // extracting more characters than
-                                     // a string contains?
+      StringSort.eps(StringSort.ex(StringSort.ex(
+        strCat(v(1, StringSort), v(2, StringSort), v(0, StringSort)) === shBigStr3 &
+        str_len(v(1, StringSort)) === shBegin3 &
+        str_len(v(2, StringSort)) === shLen3     // TODO: what should happen when
+                                                 // extracting more characters than
+                                                 // a string contains?
       )))
     }
 
@@ -130,18 +139,18 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
       val shBigStr3 = VariableShiftVisitor(bigStr, 0, 3)
       val shIndex3  = VariableShiftVisitor(index, 0, 3)
 
-      eps(StringSort.ex(StringSort.ex(
-        strCat(v(1), v(2), v(0)) === shBigStr3 &
-        str_len(v(1)) === shIndex3 &
-        str_in_re(v(2), re_allchar()) // TODO: what should happen when
-                                      // extracting a character outside of the
-                                      // string range?
+      StringSort.eps(StringSort.ex(StringSort.ex(
+        strCat(v(1, StringSort), v(2, StringSort), v(0, StringSort)) === shBigStr3 &
+        str_len(v(1, StringSort)) === shIndex3 &
+        str_in_re(v(2, StringSort), re_allchar()) // TODO: what should happen when
+                                                  // extracting a character outside of the
+                                                  // string range?
       )))
     }
 
     case (IFunApp(`str_++`, _),
           Seq(ConcreteString(str1), ConcreteString(str2))) =>
-      str2term(str1 + str2)
+      string2Term(str1 + str2)
 
     case (IFunApp(`str_from_code`, _), Seq(Const(code))) =>
       if (code >= 0 & code < theory.alphabetSize)
@@ -160,6 +169,45 @@ class OstrichPreprocessor(theory : OstrichStringTheory)
       re_charrange(lower, upper)
 
     case (t, _) =>
+      (t update subres) match {
+        case Geq(Const(bound), IFunApp(`str_len`, Seq(w))) if bound <= 1000 =>
+          // encode an upper bound using a regular expression
+          str_in_re(w, re_loop(0, bound, re_allchar()))
+        case Geq(IFunApp(`str_len`, Seq(w)), Const(bound)) if bound <= 1000 =>
+          // encode a lower bound using a regular expression
+          str_in_re(w, re_++(re_loop(bound, bound, re_allchar()), re_all()))
+        case newT =>
+          newT
+      }
+  }
+
+}
+
+
+/**
+ * Pre-processor for replacing regular expressions with just numeric ids,
+ * which streamlines the translation to automata.
+ */
+class OstrichRegexEncoder(theory : OstrichStringTheory)
+      extends ContextAwareVisitor[Unit, IExpression] {
+  import IExpression._
+  import theory._
+
+  def apply(f : IFormula) : IFormula =
+    this.visit(f, Context(())).asInstanceOf[IFormula]
+
+  def postVisit(t : IExpression,
+                ctxt : Context[Unit],
+                subres : Seq[IExpression]) : IExpression = (t, subres) match {
+    case (IAtom(`str_in_re`, _),
+          Seq(s : ITerm, ConcreteRegex(regex))) =>
+      str_in_re_id(s, theory.autDatabase.regex2Id(regex))
+    case (IAtom(`str_in_re`, _), Seq(_, regex)) => {
+      println("Warning: could not encode regular expression right away," +
+                " post-poning: " + subres)
+      t update subres
+    }
+    case _ =>
       t update subres
   }
 
